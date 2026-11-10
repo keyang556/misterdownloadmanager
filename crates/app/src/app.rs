@@ -934,6 +934,8 @@ impl App {
         // The look (#45): the chosen theme before anything is drawn.
         crate::theme::select(&crate::theme::startup_id(&loaded.settings.theme), ctx);
         crate::theme::apply(ctx);
+        // Screen readers follow the highlight in the open menu of any window (#328).
+        crate::chrome::install_menu_focus(ctx);
         // The zoom main.rs started at (View → Interface size, #262).
         let zoom = crate::scale::startup(loaded.settings.interface_size);
         let mut settings = loaded.settings;
@@ -6495,11 +6497,13 @@ impl App {
         // menu's underlined letter that menu (Windows and Linux); on macOS, whose apps have no
         // Alt keys, Ctrl+F2 (the system's key for the menu bar).
         // A focused button or list (Tab, a screen reader, #328) leaves these keys to the menu bar;
-        // only a text box keeps them.
+        // only a text box keeps them. With a menu of the bar open, the same keys close it, as
+        // Windows' menu bars do (the keys are the menu's then, a text box's too).
         let typing = ctx
             .memory(|m| m.focused())
             .is_some_and(|id| egui::TextEdit::load_state(&ctx, id).is_some());
-        if self.open_menu.is_none() && self.popup.is_none() && !typing {
+        if self.popup.is_none() && (self.open_menu.is_some() || !typing) {
+            let open_now = self.open_menu;
             let labels: Vec<String> = chrome::menus(ui.painter())
                 .iter()
                 .map(|(l, ..)| chrome::menu_letter(l))
@@ -6537,9 +6541,15 @@ impl App {
                 )
             });
             let mut open = None;
+            // The menu bar's key pressed with one of its menus open.
+            let mut close = false;
             if cfg!(target_os = "macos") {
                 if ctrl_f2 {
-                    open = Some(0);
+                    if open_now.is_some() {
+                        close = true;
+                    } else {
+                        open = Some(0);
+                    }
                 }
             } else {
                 if alt && !self.alt_down {
@@ -6550,21 +6560,47 @@ impl App {
                 if alt && other {
                     self.alt_alone = false;
                 }
-                if !alt && self.alt_down && self.alt_alone {
-                    open = Some(0);
+                if (!alt && self.alt_down && self.alt_alone) || f10 {
+                    if open_now.is_some() {
+                        close = true;
+                    } else {
+                        open = Some(0);
+                    }
                 }
-                if f10 {
-                    open = Some(0);
-                }
-                if let Some(l) = letter {
+                // With a menu open, a letter is its entries' (keyboard() in chrome::popup).
+                if open_now.is_none()
+                    && let Some(l) = letter
+                {
                     open = labels.iter().position(|m| *m == l).or(open);
                 }
             }
             self.alt_down = alt;
-            if let Some(i) = open {
+            if open.is_some() || close {
                 self.alt_alone = false;
+                // The key that opened or closed the menu is done: the menu drawn below in this
+                // pass must not take it too. Alt+T opened Tasks and chose its "Open torrent
+                // file..." (T) at once.
+                ctx.input_mut(|i| {
+                    i.events.retain(|e| {
+                        !matches!(
+                            e,
+                            egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
+                        )
+                    });
+                });
+            }
+            if let Some(i) = open {
                 self.open_menu = chrome::menubar_next(self.open_menu, MenuBarEvent::Open(i));
                 chrome::start_keyboard(&ctx, &format!("menu-{i}"));
+            }
+            if close && let Some(i) = open_now {
+                chrome::close_popup(&ctx, &format!("menu-{i}"));
+                self.open_menu = chrome::menubar_next(
+                    self.open_menu,
+                    MenuBarEvent::Dismissed {
+                        press_on_title: false,
+                    },
+                );
             }
         } else {
             self.alt_down = false;
@@ -6580,17 +6616,23 @@ impl App {
         // without a menu closed it, a new window opening for the next (#277).
         for _ in 0..2 {
             let Some(i) = self.open_menu else { break };
-            let x = chrome::menus(ui.painter())[i].1;
+            let (name, x, ..) = chrome::menus(ui.painter())[i];
             let entries = self.menu_entries(i);
             // Under the item's leading edge (the menu's top-right in RTL).
             let at = pos2(winui::mx(o.x + x), o.y + chrome::MENU_H - 1.0);
-            let event = match chrome::popup(
+            // Screen readers find it under its title, named after it.
+            let owner = chrome::MenuOwner {
+                node: chrome::menubar_title_id(i),
+                name,
+            };
+            let event = match chrome::popup_with(
                 &ctx,
                 MenuKind::Bar,
                 &format!("menu-{i}"),
                 at,
                 &entries,
                 &|c: &Cmd| c.hint(),
+                Some(owner),
             ) {
                 PopupResult::Open => None,
                 PopupResult::Neighbor(d) => {

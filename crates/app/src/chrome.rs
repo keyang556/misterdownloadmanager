@@ -244,7 +244,7 @@ pub fn menu_bar(ui: &mut Ui, o: Pos2, width: f32, open: Option<usize>) -> Option
     for (i, (label, x, w, tx)) in menus(&p).iter().enumerate() {
         // From the leading edge: the first menu at the right in RTL.
         let rc = winui::rect(Rect::from_min_size(o + vec2(*x, 0.0), vec2(*w, MENU_H)));
-        let resp = titles_ui.interact(rc, egui::Id::unique(("menubar", i)), winui::pointer_only());
+        let resp = titles_ui.interact(rc, menubar_title_id(i), winui::pointer_only());
         winui::expose(&resp, egui::Role::MenuItem, &plain(label).0, true, None);
         ui.ctx().accesskit_node_builder(resp.id, |n| {
             n.set_has_popup(egui::accesskit::HasPopup::Menu);
@@ -288,6 +288,12 @@ pub fn menu_bar(ui: &mut Ui, o: Pos2, width: f32, open: Option<usize>) -> Option
         }
     }
     hit
+}
+
+/// The node of the menu bar's title `i` for screen readers: its open menu is shown to them under
+/// it ([`MenuOwner`]).
+pub fn menubar_title_id(i: usize) -> egui::Id {
+    egui::Id::unique(("menubar", i))
 }
 
 /// The menu-bar title under `pos` (main-window coordinates), as [`menu_bar`] lays them out at
@@ -665,34 +671,41 @@ pub fn popup<C: Clone>(
     entries: &[MenuEntry<C>],
     hint: &dyn Fn(&C) -> Option<&'static str>,
 ) -> PopupResult<C> {
+    popup_with(ctx, kind, id, pos, entries, hint, None)
+}
+
+/// Where an open menu is shown to screen readers ([`popup_with`]): under the node `node` (a menu
+/// bar's title, [`menubar_title_id`]), named `name` (that title).
+#[derive(Clone, Copy)]
+pub struct MenuOwner<'a> {
+    pub node: egui::Id,
+    pub name: &'a str,
+}
+
+/// [`popup`], its menu shown to screen readers under `owner` (none: right under the window, as a
+/// context menu).
+///
+/// A screen reader follows the window that has the keyboard, and the menu's own windows never
+/// take it: there it found the menu's items, but nothing ever said one was highlighted, so the
+/// arrows were silent (#328). So the menu is shown to it again in the window that opened it (a
+/// menu, its entries with their state, shortcut and place, at the place the menu's windows show
+/// them), and the entry highlighted (by the keys, else under the pointer; none: the menu itself)
+/// is what that window's focus has as its active descendant ([`install_menu_focus`]), as a list's
+/// row is the list's. The focus stays where it was, so a text box keeps its selection for Cut
+/// and Copy. Drop-down lists ([`MenuKind::List`]) leave it to their box.
+pub fn popup_with<C: Clone>(
+    ctx: &egui::Context,
+    kind: MenuKind,
+    id: &str,
+    pos: Pos2,
+    entries: &[MenuEntry<C>],
+    hint: &dyn Fn(&C) -> Option<&'static str>,
+    owner: Option<MenuOwner<'_>>,
+) -> PopupResult<C> {
     let sub_key = egui::Id::unique(("popup-sub", id));
-    // The control that has the keys while the menu is open (a drop-down list, a text box): the
-    // menu's windows never take them, so Escape reached its window, and egui let them go there
-    // (Escape drops the focus). Escape closing the menu gives them back.
-    let opener = sub_key.with("opener");
-    let focused_now = ctx.memory(|m| m.focused());
-    if let Some(f) = focused_now {
-        ctx.data_mut(|d| d.insert_temp(opener, f));
-    }
-    let give_back = |ctx: &egui::Context| {
-        let had = ctx.data_mut(|d| {
-            let had = d.get_temp::<egui::Id>(opener);
-            d.remove::<egui::Id>(opener);
-            had
-        });
-        if let Some(had) = had
-            && focused_now.is_none()
-            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-        {
-            ctx.memory_mut(|m| m.request_focus(had));
-        }
-    };
+    keep_focus(ctx, sub_key);
     if let Some(r) = keyboard(ctx, entries, sub_key) {
-        ctx.data_mut(|d| {
-            d.remove::<usize>(sub_key);
-            d.remove::<(Option<usize>, Option<usize>)>(sub_key.with("kb"));
-        });
-        give_back(ctx);
+        forget_popup(ctx, sub_key);
         return r;
     }
     let origin = ctx
@@ -702,6 +715,10 @@ pub fn popup<C: Clone>(
     // Set by the menu's windows as they draw (popup_level) when one of them has the focus.
     let window_focus = sub_key.with("window-focus");
     ctx.data_mut(|d| d.insert_temp(window_focus, false));
+    let a11y = (kind != MenuKind::List).then(|| A11yLevel {
+        parent: owner.map(|o| o.node),
+        name: owner.map_or(String::new(), |o| plain(o.name).0),
+    });
     popup_level(
         ctx,
         kind,
@@ -713,13 +730,10 @@ pub fn popup<C: Clone>(
         &mut result,
         0,
         hint,
+        a11y,
     );
     if let Some(c) = result {
-        ctx.data_mut(|d| {
-            d.remove::<usize>(sub_key);
-            d.remove::<(Option<usize>, Option<usize>)>(sub_key.with("kb"));
-        });
-        give_back(ctx);
+        forget_popup(ctx, sub_key);
         return PopupResult::Chosen(c);
     }
     // The menus are other windows: any press that reaches the main window, Escape, or the
@@ -763,17 +777,331 @@ pub fn popup<C: Clone>(
         // the data lock (asking the context inside it deadlocks).
         let press = ctx.input(|i| i.pointer.press_origin().filter(|_| i.pointer.any_pressed()));
         let dismissed = dismissed_at_key(ctx);
-        ctx.data_mut(|d| {
-            d.remove::<usize>(sub_key);
-            d.remove::<(Option<usize>, Option<usize>)>(sub_key.with("kb"));
-            if let Some(at) = press {
-                d.insert_temp(dismissed, at);
-            }
-        });
-        give_back(ctx);
+        forget_popup(ctx, sub_key);
+        if let Some(at) = press {
+            ctx.data_mut(|d| d.insert_temp(dismissed, at));
+        }
         return PopupResult::Dismissed;
     }
+    if kind != MenuKind::List {
+        set_menu_focus(ctx, menu_focus_target(ctx, id, sub_key));
+    }
     PopupResult::Open
+}
+
+/// The keys are an open menu's ([`keyboard`]): egui's own moves of the focus on them (an arrow
+/// to the control that way, Tab to the next one, Escape dropping it) are undone, so the control
+/// that had the focus when the menu opened (or none) keeps it while the arrows go through the
+/// menu, and has it when the menu closes. Escape used to drop it, and an arrow handed it to
+/// whatever control lay that way (with a button focused, #328). A click elsewhere still moves it
+/// (and closes the menu).
+fn keep_focus(ctx: &egui::Context, sub_key: egui::Id) {
+    let key = sub_key.with("opener");
+    let keyed = ctx.input(|i| !menu_keys(i).is_empty());
+    let now = ctx.memory(|m| m.focused());
+    let keep = match ctx.data(|d| d.get_temp::<Option<egui::Id>>(key)) {
+        Some(had) if keyed => had,
+        _ => now,
+    };
+    if keyed {
+        ctx.memory_mut(|m| {
+            m.move_focus(egui::FocusDirection::None);
+            if keep != now {
+                match keep {
+                    Some(had) => m.request_focus(had),
+                    None => {
+                        if let Some(f) = now {
+                            m.surrender_focus(f);
+                        }
+                    }
+                }
+            }
+        });
+    }
+    ctx.data_mut(|d| d.insert_temp(key, keep));
+}
+
+/// Forget what an open menu kept between passes (highlight, open submenu, the focus it keeps):
+/// it closed.
+fn forget_popup(ctx: &egui::Context, sub_key: egui::Id) {
+    ctx.data_mut(|d| {
+        d.remove::<usize>(sub_key);
+        d.remove::<(Option<usize>, Option<usize>)>(sub_key.with("kb"));
+        d.remove::<Option<egui::Id>>(sub_key.with("opener"));
+        for depth in 0..2usize {
+            d.remove::<Option<usize>>(sub_key.with(("hover", depth)));
+        }
+    });
+}
+
+/// Close menu `id` from outside it ([`popup`] isn't called for it again): Alt or F10 pressed
+/// while a menu of the bar is open, as Windows' menu bars close.
+pub fn close_popup(ctx: &egui::Context, id: &str) {
+    forget_popup(ctx, egui::Id::unique(("popup-sub", id)));
+}
+
+/// A level of a menu as screen readers find it in the window that has the keyboard
+/// ([`expose_level`]): under `parent` (none: the window), named `name` (none when empty).
+struct A11yLevel {
+    parent: Option<egui::Id>,
+    name: String,
+}
+
+/// The node of menu `id`'s level `depth` for screen readers, and of its entry `i`.
+fn a11y_menu_id(id: &str, depth: usize) -> egui::Id {
+    egui::Id::unique(("menu-a11y", id, depth))
+}
+
+fn a11y_item_id(id: &str, depth: usize, i: usize) -> egui::Id {
+    egui::Id::unique(("menu-a11y-item", id, depth, i))
+}
+
+/// The node a screen reader is on in open menu `id`: the entry highlighted by the keys (or under
+/// the pointer) in its open submenu, else in the menu, else the menu itself (opened by a click,
+/// nothing highlighted yet).
+fn menu_focus_target(ctx: &egui::Context, id: &str, sub_key: egui::Id) -> egui::Id {
+    let (kb, open_sub, hover) = ctx.data(|d| {
+        (
+            d.get_temp::<(Option<usize>, Option<usize>)>(sub_key.with("kb"))
+                .unwrap_or_default(),
+            d.get_temp::<usize>(sub_key),
+            [0usize, 1].map(|depth| {
+                d.get_temp::<Option<usize>>(sub_key.with(("hover", depth)))
+                    .flatten()
+            }),
+        )
+    });
+    let in_sub = open_sub.and(kb.1.or(hover[1]));
+    match (in_sub, kb.0.or(hover[0])) {
+        (Some(j), _) => a11y_item_id(id, 1, j),
+        (None, Some(i)) => a11y_item_id(id, 0, i),
+        (None, None) => a11y_menu_id(id, 0),
+    }
+}
+
+/// The key of the node a screen reader is on in the open menu of window `viewport`.
+fn menu_focus_key(viewport: egui::ViewportId) -> egui::Id {
+    egui::Id::unique(("menu-focus", viewport))
+}
+
+/// This pass, a screen reader is on `node` of the open menu of the window drawing it.
+fn set_menu_focus(ctx: &egui::Context, node: egui::Id) {
+    let key = menu_focus_key(ctx.viewport_id());
+    ctx.data_mut(|d| d.insert_temp(key, Some(node)));
+}
+
+/// Call once for the app's context: at the end of each window's pass, the node of its open menu a
+/// screen reader is on ([`popup_with`] names it every pass the menu is drawn) becomes the active
+/// descendant of the node the window's accessibility tree has the focus on (egui's focused
+/// widget, else the window itself: both get it, egui deciding which is the focus after this),
+/// so screen readers announce it and follow the highlight. With the menu closed nothing is set,
+/// and they are back on the focus.
+pub fn install_menu_focus(ctx: &egui::Context) {
+    ctx.on_end_pass(
+        "menu-focus",
+        std::sync::Arc::new(|ui: &mut Ui| {
+            let ctx = ui.ctx();
+            let key = menu_focus_key(ctx.viewport_id());
+            let Some(node) = ctx
+                .data_mut(|d| d.remove_temp::<Option<egui::Id>>(key))
+                .flatten()
+            else {
+                return;
+            };
+            if !ctx.has_accesskit_node(node) {
+                return;
+            }
+            let focus = ctx
+                .memory(|m| m.focused())
+                .filter(|f| ctx.has_accesskit_node(*f));
+            for holder in focus.into_iter().chain([egui::accesskit_root_id()]) {
+                ctx.accesskit_node_builder(holder, |n| {
+                    n.set_active_descendant(node.accesskit_id());
+                });
+            }
+        }),
+    );
+}
+
+/// An AccessKit rectangle from `rc`, in the window's points.
+fn accesskit_rect(rc: Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rc.min.x.into(),
+        y0: rc.min.y.into(),
+        x1: rc.max.x.into(),
+        y1: rc.max.y.into(),
+    }
+}
+
+/// Entry `e`'s node `resp` for screen readers, named `text` (as shown: no access letter left to
+/// take out, so an "&" in a queue's name stays): a menu item, or a check or radio item when it
+/// shows one (`checked`: its tick or bullet) and whether it is on, and whether it can be used.
+fn expose_entry<C>(
+    resp: &egui::Response,
+    e: &MenuEntry<C>,
+    text: &str,
+    enabled: bool,
+    checked: bool,
+) {
+    let (role, on) = match e {
+        MenuEntry::Radio(..) => (egui::Role::MenuItemRadio, Some(checked)),
+        MenuEntry::Item(..) if checked => (egui::Role::MenuItemCheckBox, Some(true)),
+        _ => (egui::Role::MenuItem, None),
+    };
+    resp.widget_info(|| {
+        let mut info = egui::WidgetInfo::labeled(role, enabled, text);
+        info.selected = on;
+        info
+    });
+}
+
+/// What screen readers say of a menu entry's node `node` besides its name: its place among the
+/// entries (`position`, from 0, separators not counted; the menu has their number) and its
+/// shortcut (`keys`, as the menu writes it in its last column), as its description: the
+/// adapters don't map AccessKit's keyboard shortcut to anything they read yet.
+fn describe_entry(
+    ctx: &egui::Context,
+    node: egui::Id,
+    position: usize,
+    keys: Option<&'static str>,
+) {
+    ctx.accesskit_node_builder(node, |n| {
+        n.set_position_in_set(position);
+        if let Some(k) = keys {
+            n.set_description(key_label(k));
+        }
+    });
+}
+
+/// How many entries menu `entries` has, separators not counted.
+fn entry_count<C>(entries: &[MenuEntry<C>]) -> usize {
+    entries
+        .iter()
+        .filter(|e| !matches!(e, MenuEntry::Sep))
+        .count()
+}
+
+/// Level `depth` of open menu `id` for screen readers, in the window that has the keyboard (see
+/// [`popup_with`]): a menu at `rect` (where its own window shows it, in this window's points)
+/// and its entries at their slots, as that window lays them out. Invoking an entry chooses it
+/// (`result`), Expand and Collapse open and close a submenu, focusing one highlights it, as the
+/// keys do.
+#[allow(clippy::too_many_arguments)]
+fn expose_level<C: Clone>(
+    ctx: &egui::Context,
+    id: &str,
+    depth: usize,
+    a11y: &A11yLevel,
+    rect: Rect,
+    entries: &[MenuEntry<C>],
+    sub_key: egui::Id,
+    result: &mut Option<C>,
+    hint: &dyn Fn(&C) -> Option<&'static str>,
+) {
+    use egui::accesskit::{Action, HasPopup};
+    let mut builder = egui::UiBuilder::new()
+        .max_rect(rect)
+        .accessibility_role(egui::Role::Menu);
+    if let Some(parent) = a11y.parent {
+        builder = builder.accessibility_parent(parent);
+    }
+    if !a11y.name.is_empty() {
+        builder = builder.accessibility_label(a11y.name.clone());
+    }
+    let menu = Ui::new(ctx.clone(), a11y_menu_id(id, depth), builder);
+    let count = entry_count(entries);
+    ctx.accesskit_node_builder(menu.unique_id(), |n| {
+        n.set_bounds(accesskit_rect(rect));
+        n.set_size_of_set(count);
+    });
+    let kb_key = sub_key.with("kb");
+    let open_sub = ctx
+        .data(|d| d.get_temp::<usize>(sub_key))
+        .filter(|_| depth == 0);
+    let mut y = rect.min.y + 3.0;
+    let mut position = 0;
+    for (i, e) in entries.iter().enumerate() {
+        let (label, enabled, checked) = match e {
+            MenuEntry::Item(l, _, en, ch) | MenuEntry::Radio(l, _, en, ch) => (*l, *en, *ch),
+            MenuEntry::Sub(l, en, _) => (*l, *en, false),
+            MenuEntry::Sep => {
+                y += SEP;
+                continue;
+            }
+        };
+        let slot = Rect::from_min_max(pos2(rect.min.x + 6.0, y), pos2(rect.max.x - 6.0, y + SLOT));
+        y += SLOT;
+        let keys = match e {
+            MenuEntry::Item(_, c, ..) | MenuEntry::Radio(_, c, ..) => hint(c),
+            _ => None,
+        };
+        let text = plain(crate::i18n::tc("menu", label)).0;
+        let text = if keys.is_some() {
+            without_shortcut(&text).to_owned()
+        } else {
+            text
+        };
+        let item = menu.interact(slot, a11y_item_id(id, depth, i), egui::Sense::hover());
+        expose_entry(&item, e, &text, enabled, checked);
+        describe_entry(ctx, item.id, position, keys);
+        position += 1;
+        let is_sub = matches!(e, MenuEntry::Sub(..));
+        ctx.accesskit_node_builder(item.id, |n| {
+            n.add_action(Action::Focus);
+            if enabled {
+                n.add_action(Action::Click);
+            }
+            if is_sub {
+                n.set_has_popup(HasPopup::Menu);
+                n.set_expanded(open_sub == Some(i));
+            }
+        });
+        let (click, focus, expand, collapse) = ctx.input(|x| {
+            (
+                x.has_accesskit_action_request(item.id, Action::Click),
+                x.has_accesskit_action_request(item.id, Action::Focus),
+                x.has_accesskit_action_request(item.id, Action::Expand),
+                x.has_accesskit_action_request(item.id, Action::Collapse),
+            )
+        });
+        if !(click || focus || expand || collapse) {
+            continue;
+        }
+        // Asked for by a screen reader: no pointer moves to bring the next frame.
+        ctx.request_repaint();
+        // Highlighted, as the keys would leave it (an open submenu keeps its own highlight
+        // only when it is this entry's).
+        ctx.data_mut(|d| {
+            let (a, b) = d
+                .get_temp::<(Option<usize>, Option<usize>)>(kb_key)
+                .unwrap_or_default();
+            let kb = if depth == 0 {
+                (Some(i), b.filter(|_| open_sub == Some(i)))
+            } else {
+                (a, Some(i))
+            };
+            d.insert_temp(kb_key, kb);
+        });
+        match e {
+            MenuEntry::Item(_, c, true, _) | MenuEntry::Radio(_, c, true, _) if click => {
+                *result = Some(c.clone());
+            }
+            MenuEntry::Sub(_, true, children) if depth == 0 && (click || expand) => {
+                let first = step(children, None, 1);
+                ctx.data_mut(|d| {
+                    d.insert_temp(sub_key, i);
+                    d.insert_temp(kb_key, (Some(i), first));
+                });
+            }
+            MenuEntry::Sub(..) if depth == 0 && collapse => {
+                ctx.data_mut(|d| {
+                    d.remove::<usize>(sub_key);
+                    d.insert_temp::<(Option<usize>, Option<usize>)>(kb_key, (Some(i), None));
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 /// How long the focus may be away from every window of ours before an open menu counts as left.
@@ -1069,6 +1397,7 @@ fn popup_level<C: Clone>(
     result: &mut Option<C>,
     depth: usize,
     hint: &dyn Fn(&C) -> Option<&'static str>,
+    a11y: Option<A11yLevel>,
 ) {
     let size = menu_size(ctx, entries, hint);
     let kb_key = sub_key.with("kb");
@@ -1076,6 +1405,12 @@ fn popup_level<C: Clone>(
         .data(|d| d.get_temp::<(Option<usize>, Option<usize>)>(kb_key))
         .and_then(|(a, b)| if depth == 0 { a } else { b });
     let screen = Rect::from_min_size(place_menu(ctx, at, size, parent), size);
+    // This window's top-left on the screen, in points: where the menu is in it (expose_level).
+    let origin = ctx
+        .input(|i| i.viewport().inner_rect)
+        .map_or(Pos2::ZERO, |r| r.min);
+    let menu_name = a11y.as_ref().map_or("", |a| a.name.as_str());
+    let hover_key = sub_key.with(("hover", depth));
     let title = format!("misterdownloadmanager menu {depth}"); // not translated: an id
     let builder = popup_viewport(&title)
         .with_active(false)
@@ -1145,8 +1480,14 @@ fn popup_level<C: Clone>(
             egui::Id::unique(("menu-node", id, depth)),
             egui::Sense::hover(),
         );
-        winui::expose(&menu_node, egui::Role::Menu, "", true, None);
+        winui::expose(&menu_node, egui::Role::Menu, menu_name, true, None);
+        let count = entry_count(entries);
+        ui.ctx()
+            .accesskit_node_builder(menu_node.id, |n| n.set_size_of_set(count));
         let items_ui = ui.new_child(egui::UiBuilder::new().accessibility_parent(menu_node.id));
+        // The entry under the pointer, for the one a screen reader is on (menu_focus_target).
+        let mut under_pointer = None;
+        let mut position = 0;
         let mut y = o.y + 3.0;
         for (i, e) in entries.iter().enumerate() {
             if matches!(e, MenuEntry::Sep) {
@@ -1168,6 +1509,9 @@ fn popup_level<C: Clone>(
             };
             let slot = Rect::from_min_max(pos2(o.x + 6.0, y), pos2(o.x + w - 6.0, y + SLOT));
             let hovered = pointer.is_some_and(|p| slot.contains(p));
+            if hovered {
+                under_pointer = Some(i);
+            }
             if hovered && moving && kb.is_some() && kb != Some(i) {
                 ui.ctx().data_mut(|d| {
                     let (a, b) = d
@@ -1232,12 +1576,9 @@ fn popup_level<C: Clone>(
                 egui::Id::unique(("menu-item", id, depth, i)),
                 winui::pointer_only(),
             );
-            let (role, on) = match e {
-                MenuEntry::Radio(..) => (egui::Role::MenuItemRadio, Some(checked)),
-                MenuEntry::Item(..) if checked => (egui::Role::MenuItemCheckBox, Some(true)),
-                _ => (egui::Role::MenuItem, None),
-            };
-            winui::expose(&item, role, &t, enabled, on);
+            expose_entry(&item, e, &t, enabled, checked);
+            describe_entry(ui.ctx(), item.id, position, keys);
+            position += 1;
             if let MenuEntry::Sub(..) = e {
                 let open = open_sub == Some(i);
                 ui.ctx().accesskit_node_builder(item.id, |n| {
@@ -1366,12 +1707,18 @@ fn popup_level<C: Clone>(
             }
             y += SLOT;
         }
+        ui.ctx().data_mut(|d| d.insert_temp(hover_key, under_pointer));
     });
     if styled {
         show_popup(ctx, vid);
     }
+    // For screen readers, in this window (the one with the keyboard): see popup_with.
+    if let Some(a11y) = &a11y {
+        let rect = screen.translate(-origin.to_vec2());
+        expose_level(ctx, id, depth, a11y, rect, entries, sub_key, result, hint);
+    }
     if let Some((i, slot_y)) = sub_at
-        && let MenuEntry::Sub(_, _, children) = &entries[i]
+        && let MenuEntry::Sub(label, _, children) = &entries[i]
     {
         // The submenu's top-left: parent right − 6, slot top − 3 (as measured); in RTL its
         // top-right at parent left + 6.
@@ -1381,6 +1728,11 @@ fn popup_level<C: Clone>(
             screen.max.x - 6.0
         };
         let at = pos2(x, screen.min.y + slot_y - 3.0);
+        // Under its entry, named after it.
+        let sub_a11y = a11y.as_ref().map(|_| A11yLevel {
+            parent: Some(a11y_item_id(id, depth, i)),
+            name: plain(crate::i18n::tc("menu", label)).0,
+        });
         popup_level(
             ctx,
             kind,
@@ -1392,6 +1744,7 @@ fn popup_level<C: Clone>(
             result,
             depth + 1,
             hint,
+            sub_a11y,
         );
     }
 }
@@ -2455,5 +2808,141 @@ mod tests {
             run(&[MenuBarEvent::Open(0), MenuBarEvent::Open(4)]),
             [Some(0), Some(4)]
         );
+    }
+
+    /// #328: an open menu is shown to screen readers in the window that has the keyboard (its own
+    /// windows never do, so the arrows were silent): the entry the keys highlight is the active
+    /// descendant of that window's focus, with its name, state and place. The focus stays on its
+    /// control (the arrows and Escape no longer move it), and is the screen reader's again once
+    /// the menu closes.
+    #[test]
+    fn screen_readers_follow_the_highlight_of_an_open_menu() {
+        use super::{
+            MenuEntry, MenuOwner, PopupResult, a11y_item_id, a11y_menu_id, install_menu_focus,
+            menubar_title_id, popup_with, start_keyboard,
+        };
+        use egui::accesskit::{Action, ActionRequest, Node, NodeId, Role, TreeId, TreeUpdate};
+        use egui::{Event, Key, Rect, pos2, vec2};
+
+        // Labels from variables: the catalog's extractor takes literal ones as texts to translate.
+        let (title, add, open, more, inner) = ("&Tasks", "&Add", "&Open", "&More", "&Inner");
+        let entries = [
+            MenuEntry::Item(add, 1u8, true, false),
+            MenuEntry::Sep,
+            MenuEntry::Item(open, 2, false, false),
+            MenuEntry::Sub(more, true, vec![MenuEntry::Item(inner, 3, true, false)]),
+        ];
+        let id = "menu-test";
+        let (button, below) = (egui::Id::new("test-button"), egui::Id::new("test-below"));
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        install_menu_focus(&ctx);
+        // A pass: two buttons (the first has the keys, the second lies below it), the menu bar's
+        // title, and its menu.
+        let pass = |events: Vec<Event>| -> (TreeUpdate, PopupResult<u8>) {
+            let mut result = None;
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                for (b, y) in [(button, 300.0), (below, 340.0)] {
+                    let rc = Rect::from_min_size(pos2(10.0, y), vec2(80.0, 24.0));
+                    let resp = ui.interact(rc, b, egui::Sense::click());
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, add));
+                }
+                let rc = Rect::from_min_size(pos2(0.0, 0.0), vec2(40.0, 20.0));
+                let resp = ui.interact(rc, menubar_title_id(0), egui::Sense::CLICK);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::MenuItem, true, title));
+                let owner = MenuOwner {
+                    node: menubar_title_id(0),
+                    name: title,
+                };
+                let (at, kind) = (pos2(0.0, 19.0), MenuKind::Bar);
+                let r = popup_with(ui.ctx(), kind, id, at, &entries, &|_| None, Some(owner));
+                result = Some(r);
+            });
+            out.textures_delta.clear();
+            let tree = out.platform_output.accesskit_update.expect("a tree");
+            (tree, result.expect("the menu"))
+        };
+        let key = |key: Key| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let node = |tree: &TreeUpdate, id: NodeId| -> Node {
+            let found = tree.nodes.iter().find(|(n, _)| *n == id);
+            found.expect("a node").1.clone()
+        };
+        // What a screen reader is on: the focus's active descendant, else the focus.
+        let on = |tree: &TreeUpdate| {
+            let focus = node(tree, tree.focus);
+            focus.active_descendant().unwrap_or(tree.focus)
+        };
+        let entry = |depth: usize, i: usize| a11y_item_id(id, depth, i).accesskit_id();
+        let focus = button.accesskit_id();
+
+        // Opened from the keyboard with the first button focused: on the menu's first entry.
+        ctx.memory_mut(|m| m.request_focus(button));
+        start_keyboard(&ctx, id);
+        let (tree, r) = pass(vec![]);
+        assert!(matches!(r, PopupResult::Open));
+        assert_eq!(tree.focus, focus);
+        assert_eq!(on(&tree), entry(0, 0));
+        let first = node(&tree, entry(0, 0));
+        assert_eq!(first.role(), Role::MenuItem);
+        assert_eq!(first.label(), Some("Add"));
+        assert_eq!(first.position_in_set(), Some(0));
+        // Its menu: under its title in the menu bar, named after it, with its 3 entries.
+        let menu = a11y_menu_id(id, 0).accesskit_id();
+        let title_node = node(&tree, menubar_title_id(0).accesskit_id());
+        assert!(title_node.children().contains(&menu));
+        let menu = node(&tree, menu);
+        assert_eq!((menu.role(), menu.label()), (Role::Menu, Some("Tasks")));
+        assert_eq!(menu.size_of_set(), Some(3));
+
+        // Down: the next entry (past the separator), greyed. The button keeps the focus: egui
+        // had handed it to the button below.
+        let (tree, _) = pass(vec![key(Key::ArrowDown)]);
+        assert_eq!(tree.focus, focus);
+        assert_eq!(on(&tree), entry(0, 2));
+        let greyed = node(&tree, entry(0, 2));
+        assert!(greyed.is_disabled());
+        assert_eq!(greyed.position_in_set(), Some(1));
+
+        // Down, Right: into the submenu, which is under its entry, now expanded.
+        pass(vec![key(Key::ArrowDown)]);
+        let (tree, _) = pass(vec![key(Key::ArrowRight)]);
+        assert_eq!(on(&tree), entry(1, 0));
+        let sub_entry = node(&tree, entry(0, 3));
+        assert_eq!(sub_entry.is_expanded(), Some(true));
+        let sub = a11y_menu_id(id, 1).accesskit_id();
+        assert!(sub_entry.children().contains(&sub));
+
+        // Escape: out of the submenu. Again: the menu closes, and the screen reader is back on the
+        // button, which kept the focus (Escape had dropped it).
+        let (tree, _) = pass(vec![key(Key::Escape)]);
+        assert_eq!(on(&tree), entry(0, 3));
+        assert_eq!(node(&tree, entry(0, 3)).is_expanded(), Some(false));
+        let (tree, r) = pass(vec![key(Key::Escape)]);
+        assert!(matches!(r, PopupResult::Dismissed));
+        assert_eq!(tree.focus, focus);
+        assert_eq!(on(&tree), focus);
+        assert!(ctx.memory(|m| m.has_focus(button)));
+
+        // A screen reader's Invoke (AccessKit's Click) on an entry chooses it.
+        start_keyboard(&ctx, id);
+        pass(vec![]);
+        let click = Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Click,
+            target_tree: TreeId::ROOT,
+            target_node: entry(0, 0),
+            data: None,
+        });
+        let (_, r) = pass(vec![click]);
+        assert!(matches!(r, PopupResult::Chosen(1)));
     }
 }

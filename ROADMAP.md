@@ -470,6 +470,8 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 - ✅ Far more file types taken by default: AI models and datasets, 3D and CAD, design and camera
   RAW, ebooks, Office, disk images and split archives; a list never edited gains them
   ([#382](https://github.com/anefzaoui/misterdownloadmanager/issues/382))
+- ✅ Alt and F10 open the menu bar while a button or the list has the keyboard focus (part of
+  [#328](https://github.com/anefzaoui/misterdownloadmanager/issues/328))
 - ✅ A save folder relative to the home folder is found where it really is
 - ✅ Browser link import: tighter handling of site data
 - ✅ The extension asks for a newer MDM only when a whole release separates them, not over a
@@ -549,8 +551,9 @@ These ship in a later version, when they're ready.
   ([#493](https://github.com/anefzaoui/misterdownloadmanager/issues/493)): fix in review
 - 🔄 **Open folder** on Windows always starting Explorer, even with another file manager set up
   to open folders ([#446](https://github.com/anefzaoui/misterdownloadmanager/issues/446)): fix in review
-- 🔄 Alt and F10 opening the menu bar with a control focused
-  ([#328](https://github.com/anefzaoui/misterdownloadmanager/issues/328)): fix in review
+- 🔄 Screen readers following the menus
+  ([#328](https://github.com/anefzaoui/misterdownloadmanager/issues/328)): NVDA silent as the
+  arrows went through a menu of the menu bar or a right-click menu; fix in review
 - 🔄 Crash on Windows when a window opens while MDM falls back from Direct3D to OpenGL
   ([#337](https://github.com/anefzaoui/misterdownloadmanager/issues/337)): fix in review
 - 🔄 Crash on Windows when a screen goes away while MDM runs
