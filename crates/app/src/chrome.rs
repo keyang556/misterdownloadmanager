@@ -1707,7 +1707,8 @@ fn popup_level<C: Clone>(
             }
             y += SLOT;
         }
-        ui.ctx().data_mut(|d| d.insert_temp(hover_key, under_pointer));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(hover_key, under_pointer));
     });
     if styled {
         show_popup(ctx, vid);
@@ -2833,7 +2834,8 @@ mod tests {
             MenuEntry::Sub(more, true, vec![MenuEntry::Item(inner, 3, true, false)]),
         ];
         let id = "menu-test";
-        let (button, below) = (egui::Id::new("test-button"), egui::Id::new("test-below"));
+        let button = egui::Id::unique("test-button");
+        let below = egui::Id::unique("test-below");
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         install_menu_focus(&ctx);
